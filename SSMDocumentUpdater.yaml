@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "A CloudFormation stack for receiving notifications when there has been an update to an AWS Systems Manager Document."
+Parameters:
+    SSMDocument:
+        Type: String
+        Description: The SSM Document to check for updated versions.
+    CurrentVersion:
+        Type: Number
+        Default: 0
+    UpdateSchedule:
+        Type: String
+        Description: The schedule frequency for checking for SSM document updates.
+        Default: "rate(1 day)"
+
+Resources:
+    SNSTopic:
+        Type: "AWS::SNS::Topic"
+        Properties:
+            DisplayName: ""
+            TopicName: !Sub "${SSMDocument}-Version"
+
+    SSMParameter:
+        Type: "AWS::SSM::Parameter"
+        Properties:
+            Name: !Sub "Version-${SSMDocument}"
+            Type: "String"
+            Value: !Sub "${CurrentVersion}"
+            DataType: "text"
+            Tier: "Standard"
+
+    IAMManagedPolicy:
+        Type: "AWS::IAM::ManagedPolicy"
+        Properties:
+            ManagedPolicyName: !Sub "AWSLambdaBasicExecutionRole-${AWS::StackName}"
+            Path: "/service-role/"
+            PolicyDocument: !Sub |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "logs:CreateLogGroup",
+                            "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents"
+                            ],
+                            "Resource": [
+                                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${SSMDocument}-Updater-${AWS::StackName}:*"
+                            ]
+                        }
+                    ]
+                }
+
+    IAMManagedPolicy2:
+        Type: "AWS::IAM::ManagedPolicy"
+        Properties:
+            ManagedPolicyName: !Sub "AWSLambdaSNSTopicDestinationExecutionRole-${AWS::StackName}"
+            Path: "/service-role/"
+            PolicyDocument: !Sub |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "sns:Publish",
+                            "Resource": "${SNSTopic}"
+                        }
+                    ]
+                }
+
+    IAMManagedPolicy3:
+        Type: "AWS::IAM::ManagedPolicy"
+        Properties:
+            ManagedPolicyName: LambdaSSMFunctionAccess
+            Path: "/service-role/"
+            PolicyDocument: !Sub |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "ssm:GetParameter",
+                                "ssm:GetParameters",
+                                "ssm:GetParametersByPath",
+                                "ssm:PutParameter"
+                            ],
+                            "Resource": [
+                                "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/Version-${SSMDocument}"
+                            ]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "ssm:DescribeDocument"
+                            ],
+                            "Resource": "*"
+                        }
+                    ]
+                }
+
+    IAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "${SSMDocument}-Updater-role-${AWS::StackName}"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - !Ref IAMManagedPolicy
+              - !Ref IAMManagedPolicy2
+              - !Ref IAMManagedPolicy3
+
+    LambdaFunction:
+        Type: "AWS::Lambda::Function"
+        DependsOn: IAMRole
+        Properties:
+            Description: !Sub "Function for checking for updates to ${SSMDocument} SSM Document"
+            FunctionName: !Sub "${SSMDocument}-Updater-${AWS::StackName}"
+            Handler: "index.lambda_handler"
+            Architectures: 
+              - "x86_64"
+            Code: 
+                ZipFile: !Sub |
+                    import boto3
+
+                    ssm = boto3.client('ssm')
+                    sns = boto3.client('sns')
+                    
+                    def lambda_handler(event, context):
+                        # Get the latest version of the Systems Manager document
+                        response = ssm.describe_document(
+                            Name='${SSMDocument}'
+                        )
+                        print(response)
+                        latest_version = response['Document']['LatestVersion']
+                        
+                        # Get the version number stored in Systems Manager Parameter Store
+                        param_value = ssm.get_parameter(Name='Version-${SSMDocument}')
+                        stored_version = param_value['Parameter']['Value']
+                        
+                        # Compare the two versions and take action as necessary
+                        if latest_version == stored_version:
+                            print("The document is up to date.")
+                        else:
+                            print("The document needs to be updated.")
+                            snsArn = 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SSMDocument}-Version'
+                            message = "The ${SSMDocument} SSM Document has been updated. Latest version number: " + latest_version
+                            ssm.put_parameter(
+                                Name='Version-${SSMDocument}',
+                                Value=latest_version,
+                                Type='String',  
+                                Overwrite=True
+                            )
+                            sns.publish(TopicArn=snsArn, Message=message)
+
+            MemorySize: 128
+            Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/${SSMDocument}-Updater-role-${AWS::StackName}"
+            Runtime: "python3.9"
+            Timeout: 3
+            TracingConfig: 
+                Mode: "PassThrough"
+            EphemeralStorage: 
+                Size: 512
+
+    LambdaPermission:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !GetAtt LambdaFunction.Arn
+            Principal: "events.amazonaws.com"
+            SourceArn: !GetAtt EventsRule.Arn
+
+    EventsRule:
+        Type: "AWS::Events::Rule"
+        Properties:
+            Name: !Sub "${SSMDocument}-Schedule"
+            Description: "Schedule for executing Lambda function to check for updates to ${SSMDocument} SSM Document"
+            ScheduleExpression: !Sub "${UpdateSchedule}"
+            State: "ENABLED"
+            Targets: 
+              - 
+                Arn: !GetAtt LambdaFunction.Arn
+                Id: !Sub "${SSMDocument}-Lambda"
+            EventBusName: "default"
+
