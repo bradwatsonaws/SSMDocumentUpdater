@@ -179,7 +179,7 @@ Resources:
         Type: "AWS::Events::Rule"
         Properties:
             Name: !Sub "${SSMDocument}-Schedule"
-            Description: "Schedule for executing Lambda function to check for updates to ${SSMDocument} SSM Document"
+            Description: !Sub "Schedule for executing Lambda function to check for updates to ${SSMDocument} SSM Document"
             ScheduleExpression: !Sub "${UpdateSchedule}"
             State: "ENABLED"
             Targets: 
